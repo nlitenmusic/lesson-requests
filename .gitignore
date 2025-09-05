@@ -1,0 +1,17 @@
+# macOS junk files
+.DS_Store
+
+# Python bytecode / cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
+# Environment config
+.env
+
+# Google credentials and tokens
+client_secret.json
+token.json
+*.json
