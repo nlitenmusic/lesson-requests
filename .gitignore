@@ -8,6 +8,9 @@ __pycache__/
 # Virtual environments
 venv/
 
+# Output files
+lesson_requests.csv
+
 # Environment config
 .env
 
