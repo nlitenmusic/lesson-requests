@@ -164,13 +164,13 @@ def normalize_ampm(t):
     else:
         return f"{hour}:{minute:02d} {am_pm}"
 
-def strip_forwarded_content(text: str) -> str:
+def strip_end_content(text: str) -> str:
     if not text:
         return text
     forwarded_markers = [
         "Forwarded message", "---------- Forwarded message ---------",
         "---------- Original Message ----------", "-------- Original message --------",
-        "On Wed, ", "Begin forwarded message:"
+        "On Wed, ", "Begin forwarded message:", "Thanks"
     ]
     for marker in forwarded_markers:
         idx = text.lower().find(marker.lower()) 
@@ -189,6 +189,24 @@ def remove_month_dates(text: str) -> str:
     numeric_date_pattern = r"\b\d{1,2}/\d{1,2}\b"
     text = re.sub(month_day_pattern, "", text, flags=re.IGNORECASE)
     text = re.sub(numeric_date_pattern, "", text)
+    return text.strip()
+
+def strip_signature_numbers(text: str) -> str:
+    if not text:
+        return text
+
+    patterns = [
+        # Phone numbers
+        r"(?:\+1\s*[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?:\s*(?:ext\.?|x|extension)\s*\d+)?",
+        # Zip codes (5 or 9 digit)
+        r"\b\d{5}(?:-\d{4})?\b",
+        # Street numbers (at start of a line or before a street name)
+        r"\b\d{1,5}\s+(?:[A-Za-z]+\s){0,3}(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Boulevard|Blvd|Court|Ct)\b",
+    ]
+
+    for pat in patterns:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE)
+
     return text.strip()
 
 def parse_normalized_time(norm_time_str):
@@ -219,7 +237,7 @@ def parse_lesson_requests(subject: str, body: str, date_obj=None):
     time_regex = r'(?:1[0-2]|0?\d)(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)?'
     text = f"{subject} {body}"
     results = []
-    stop_tokens = r"(?=\b" + day_regex + r"\b|Sent|Thanks|Racquets|Justin M. Foster|$)"
+    stop_tokens = r"(?=\b" + day_regex + r"\b|Sent|Thanks|Racquets|$)"
     pattern = re.compile(day_regex + r"\b(.*?)" + stop_tokens, re.IGNORECASE | re.DOTALL)
     seen_pairs = set()
 
@@ -296,8 +314,9 @@ def main():
 
         subject_clean = normalize_text(subject)
         body_clean = normalize_text(body)
-        body_clean = strip_forwarded_content(body_clean)
+        body_clean = strip_end_content(body_clean)
         body_clean = remove_month_dates(body_clean)
+        body_clean = strip_signature_numbers(body_clean)
         subject_clean = remove_month_dates(subject_clean)
         
         if contains_lesson_keywords(subject) or contains_lesson_keywords(body):
