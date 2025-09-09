@@ -7,6 +7,7 @@ from googleapiclient.discovery import build
 import json
 import unicodedata
 import re
+import csv
 import base64
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime, parseaddr
@@ -15,13 +16,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
+KNOWN_PLAYERS_PATH = os.environ.get("KNOWN_PLAYERS")
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 OUTPUT_FILE = os.getenv("OUTPUT_FILE")
 MY_EMAIL = os.getenv("MY_EMAIL")
 BLOCKED_SENDERS = os.getenv("BLOCKED_SENDERS").split(",")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE")
 TOKEN_FILE = os.getenv("TOKEN_FILE")
-script_dir = os.path.dirname(os.path.abspath(__file__))
+CLUB_SCHEDULE = {
+    "Monday": ["12:00 PM", "1:30 PM", "2:30 PM"],
+    "Wednesday": ["9:00 AM", "10:00 AM", "11:00 AM"],
+    "Thursday": ["2:30 PM"],
+    "Sunday": ["2:30 PM", "3:30 PM", "4:30 PM", "5:30 PM"]
+}
 
 LESSON_KEYWORDS = [
     'lesson', 'hi jordan', 'book', 'kg', 'tennis', 'schedule', 'wednesday'
@@ -223,7 +231,42 @@ def parse_normalized_time(norm_time_str):
     except ValueError:
         return None
 
-def parse_lesson_requests(subject: str, body: str, date_obj=None):
+def preprocess_club_schedule(schedule):
+    """Take raw CLUB_SCHEDULE times and convert them into datetime.time objects."""
+    processed = {}
+    for day, times in schedule.items():
+        processed_times = []
+        for t in times:
+            # Step 1: normalize into AM/PM string
+            norm_str = normalize_ampm(t)
+
+            # Step 2: turn that normalized string into a datetime.time object
+            dt_time = parse_normalized_time(norm_str)
+
+            if dt_time:
+                processed_times.append(dt_time)
+
+        processed[day] = processed_times
+    return processed
+
+def expand_lesson_requests(requests, club_schedule):
+    expanded_requests = []
+    for req in requests:
+        day = req["Date"]
+        requested_time = req.get("Requested Time")
+
+        if requested_time:
+            expanded_requests.append(req.copy())
+        else:
+            available_times = club_schedule.get(day, [])
+            for t in available_times:  # t is already a datetime.time object
+                expanded_req = req.copy()
+                expanded_req["Requested Time"] = t
+                expanded_requests.append(expanded_req)
+
+    return expanded_requests
+
+def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None):
     day_map = {
         "mon": "Monday", "monday": "Monday",
         "tue": "Tuesday", "tues": "Tuesday", "tuesday": "Tuesday",
@@ -242,17 +285,25 @@ def parse_lesson_requests(subject: str, body: str, date_obj=None):
     seen_pairs = set()
 
     for match in pattern.finditer(text):
-        raw_day = match.group(1) 
+        raw_day = match.group(1)
         day = day_map[raw_day.lower()]
-        following_text = match.group(2) 
+        following_text = match.group(2)
         start_idx = match.start()
-        preceding_text = text[max(0, start_idx - 75):start_idx]
+
+        # First, look for times after the day keyword
         times_after = re.findall(time_regex, following_text, re.IGNORECASE)
-        times_before = re.findall(time_regex, preceding_text, re.IGNORECASE)
-        unique_times = set(times_before + times_after) 
+
+        # Only check preceding text if no times were found after
+        if times_after:
+            unique_times = set(times_after)
+        else:
+            preceding_text = text[max(0, start_idx - 30):start_idx]  # tighter window
+            times_before = re.findall(time_regex, preceding_text, re.IGNORECASE)
+            unique_times = set(times_before)
+
         for t in unique_times:
             norm_time = normalize_ampm(t)
-            time_obj = parse_normalized_time(norm_time) 
+            time_obj = parse_normalized_time(norm_time)
             if (day, time_obj) not in seen_pairs:
                 seen_pairs.add((day, time_obj))
                 results.append({"day": day, "time": time_obj})
@@ -275,8 +326,17 @@ def parse_lesson_requests(subject: str, body: str, date_obj=None):
                 seen_pairs.add((d, None))
                 results.append({"day": d, "time": None})
 
-    if not results and date_obj:
-        results.append({"day": date_obj.strftime('%A'), "time": None})
+    if not results:
+    # Check if this player exists in the known players list
+        known_player = next((kp for kp in known_players if kp["Player Name"] == player_name), None)
+        if known_player:
+            day = known_player["Date"]  # use the date from known_players.csv
+        elif date_obj:
+            day = date_obj.strftime('%A')  # fallback to email parsed date
+        else:
+            day = None
+
+        results.append({"day": day, "time": None})
 
     return results
 
@@ -285,7 +345,25 @@ def format_time_for_output(t):
         return t.strftime("%I:%M %p").lstrip("0")
     return t
 
+def load_known_players(filepath):
+    if not os.path.exists(filepath):
+        print(f"⚠️ Known players file not found at {filepath}")
+        return []
+
+    known_players = []
+    with open(filepath, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Ensure 'Date' is a proper datetime object or string you can use later
+            known_players.append({
+                "Player Name": row["name"].strip(),
+                "Email": row["email"].strip(),
+                "Date": row["usual_date"].strip()  # or parse to datetime if needed
+            })
+    return known_players
+
 def main():
+    known_players = load_known_players(KNOWN_PLAYERS_PATH)
     service = authenticate_gmail()
     messages = fetch_emails(service)
     anchor_wed = most_recent_wednesday() 
@@ -322,7 +400,7 @@ def main():
         if contains_lesson_keywords(subject) or contains_lesson_keywords(body):
             display_name, _ = parseaddr(sender)
             player_name = display_name.strip() if display_name else 'Unknown'
-            parsed_requests = parse_lesson_requests(subject_clean, body_clean, date_obj)
+            parsed_requests = parse_lesson_requests(subject_clean, body_clean, player_name, known_players, date_obj)
             for req in parsed_requests:
                 lesson_requests.append({
                     'Date': req['day'],
@@ -336,6 +414,9 @@ def main():
     if not lesson_requests:
         print("The lesson availability email hasn't been sent or no lessons requested yet")
         return
+    
+    processed_schedule = preprocess_club_schedule(CLUB_SCHEDULE)
+    lesson_requests = expand_lesson_requests(lesson_requests, processed_schedule)
 
     df = pd.DataFrame(lesson_requests)
     weekday_order = {
