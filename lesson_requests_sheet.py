@@ -18,6 +18,7 @@ load_dotenv()
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 KNOWN_PLAYERS_PATH = os.environ.get("KNOWN_PLAYERS")
+REGULAR_PLAYERS_PATH = os.environ.get("REGULAR_PLAYERS")
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 OUTPUT_FILE = os.getenv("OUTPUT_FILE")
 MY_EMAIL = os.getenv("MY_EMAIL")
@@ -362,6 +363,41 @@ def load_known_players(filepath):
             })
     return known_players
 
+def load_regular_players(filepath):
+    if not os.path.exists(filepath):
+        print(f"⚠️ Regular players file not found at {filepath}")
+        return []
+    regular_players = []
+    with open(filepath, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            regular_players.append({
+                "name": row["name"].strip(),
+                "email": row["email"].strip(),
+                "usual_slots": row["usual_date"].strip()
+            })
+    return regular_players
+
+def expand_regular_players(regular_players, processed_schedule):
+    """
+    Expand regular players into lesson request entries
+    using the preprocessed club schedule for consistency.
+    """
+    results = []
+    for player in regular_players:
+        days = [d.strip() for d in re.split(r'[,\s]+', player["usual_slots"]) if d.strip()]
+        for day in days:
+            if day not in processed_schedule:
+                continue  # skip invalid days
+            for slot in processed_schedule[day]:
+                results.append({
+                    "Player Name": player["name"],
+                    "Email": player["email"],
+                    "Date": day,
+                    "Requested Time": slot,
+                })
+    return results
+
 def main():
     known_players = load_known_players(KNOWN_PLAYERS_PATH)
     service = authenticate_gmail()
@@ -417,6 +453,12 @@ def main():
     
     processed_schedule = preprocess_club_schedule(CLUB_SCHEDULE)
     lesson_requests = expand_lesson_requests(lesson_requests, processed_schedule)
+
+# Starting next week, I'll include this logic 
+    # regular_players = load_regular_players(REGULAR_PLAYERS_PATH)
+    # regular_entries = expand_regular_players(regular_players, processed_schedule)
+    # lesson_requests.extend(regular_entries)
+
 
     df = pd.DataFrame(lesson_requests)
     weekday_order = {

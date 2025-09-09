@@ -11,6 +11,10 @@ venv/
 # Output files
 lesson_requests.csv
 
+# Input files
+known_players.csv
+regular_players.csv
+
 # Environment config
 .env
 
