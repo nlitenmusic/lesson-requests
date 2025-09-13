@@ -26,12 +26,11 @@ BLOCKED_SENDERS = os.getenv("BLOCKED_SENDERS").split(",")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE")
 TOKEN_FILE = os.getenv("TOKEN_FILE")
 CLUB_SCHEDULE = {
-    "Monday": ["12:00 PM", "1:30 PM", "2:30 PM"],
-    "Wednesday": ["9:00 AM", "10:00 AM", "11:00 AM"],
-    "Thursday": ["2:30 PM"],
-    "Sunday": ["2:30 PM", "3:30 PM", "4:30 PM", "5:30 PM"]
+    "Monday": ["12:00pm", "1:30pm", "2:30pm"],
+    "Wednesday": ["7:00am", "2:30pm"],
+    "Thursday": ["1:30pm", "2:30pm"],
+    "Sunday": ["2:30pm", "3:30pm", "4:30pm", "5:30pm"]
 }
-
 LESSON_KEYWORDS = [
     'lesson', 'hi jordan', 'book', 'kg', 'tennis', 'schedule', 'wednesday'
 ]
@@ -179,7 +178,7 @@ def strip_end_content(text: str) -> str:
     forwarded_markers = [
         "Forwarded message", "---------- Forwarded message ---------",
         "---------- Original Message ----------", "-------- Original message --------",
-        "On Wed, ", "Begin forwarded message:", "Thanks"
+        "On Wed, ", "Begin forwarded message:", "Thanks", "Best"
     ]
     for marker in forwarded_markers:
         idx = text.lower().find(marker.lower()) 
@@ -267,7 +266,7 @@ def expand_lesson_requests(requests, club_schedule):
 
     return expanded_requests
 
-def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None):
+def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None, sender_email=None):
     day_map = {
         "mon": "Monday", "monday": "Monday",
         "tue": "Tuesday", "tues": "Tuesday", "tuesday": "Tuesday",
@@ -279,22 +278,21 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
     }
     day_regex = r'\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Weds|Wednesday|Thu|Thurs|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b'
     time_regex = r'(?:1[0-2]|0?\d)(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)?'
+
     text = f"{subject} {body}"
     results = []
     stop_tokens = r"(?=\b" + day_regex + r"\b|Sent|Thanks|Racquets|$)"
     pattern = re.compile(day_regex + r"\b(.*?)" + stop_tokens, re.IGNORECASE | re.DOTALL)
     seen_pairs = set()
 
+    # Primary pass: find explicit day mentions and associated times (prefer times after the day)
     for match in pattern.finditer(text):
         raw_day = match.group(1)
         day = day_map[raw_day.lower()]
         following_text = match.group(2)
         start_idx = match.start()
 
-        # First, look for times after the day keyword
         times_after = re.findall(time_regex, following_text, re.IGNORECASE)
-
-        # Only check preceding text if no times were found after
         if times_after:
             unique_times = set(times_after)
         else:
@@ -308,9 +306,12 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
             if (day, time_obj) not in seen_pairs:
                 seen_pairs.add((day, time_obj))
                 results.append({"day": day, "time": time_obj})
-    
+
+    # Post-pass: collect all found day/time tokens for other heuristics
     days_found = re.findall(day_regex, text, re.IGNORECASE)
     times_found = re.findall(time_regex, text, re.IGNORECASE)
+
+    # Case: multiple days listed and a single time -> map that time to all days
     if len(days_found) > 1 and len(times_found) == 1:
         normalized_days = [day_map[d.lower()] for d in days_found]
         norm_time = normalize_ampm(times_found[0])
@@ -320,6 +321,7 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
                 seen_pairs.add((d, time_obj))
                 results.append({"day": d, "time": time_obj})
 
+    # Case: days found but no times -> create day entries with time=None
     if not results and days_found and not times_found:
         normalized_days = [day_map[d.lower()] for d in days_found]
         for d in normalized_days:
@@ -327,19 +329,58 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
                 seen_pairs.add((d, None))
                 results.append({"day": d, "time": None})
 
-    if not results:
-    # Check if this player exists in the known players list
-        known_player = next((kp for kp in known_players if kp["Player Name"] == player_name), None)
-        if known_player:
-            day = known_player["Date"]  # use the date from known_players.csv
-        elif date_obj:
-            day = date_obj.strftime('%A')  # fallback to email parsed date
-        else:
-            day = None
+    # NEW: times found but no days -> match the sender by email and use their usual_slots
+    if not results and times_found and not days_found and sender_email:
+        norm_times = [normalize_ampm(t) for t in times_found]
+        time_objs = [parse_normalized_time(nt) for nt in norm_times if parse_normalized_time(nt) is not None]
+        if time_objs:
+            known_player = find_known_player(known_players, sender_email=sender_email, player_name=player_name)
+            if known_player:
+                usual_slots_str = known_player.get("usual_slots", "")
+                if usual_slots_str:
+                    tokens = re.split(r"[,\s]+", usual_slots_str.strip())
+                    for token in tokens:
+                        if not token:
+                            continue
+                        token_day = day_map.get(token.lower())
+                        if not token_day:
+                            continue
+                        for time_obj in time_objs:
+                            if (token_day, time_obj) not in seen_pairs:
+                                seen_pairs.add((token_day, time_obj))
+                                results.append({"day": token_day, "time": time_obj})
 
-        results.append({"day": day, "time": None})
+    # FINAL fallback: no parsed results at all -> try known_player usual_slots -> date_obj -> None
+    if not results:
+        known_player = find_known_player(known_players, sender_email=sender_email, player_name=player_name)
+        if known_player:
+            usual_slots_str = known_player.get("usual_slots", "")
+            if usual_slots_str:
+                tokens = re.split(r"[,\s]+", usual_slots_str.strip())
+                for token in tokens:
+                    if not token:
+                        continue
+                    token_day = day_map.get(token.lower())
+                    if not token_day:
+                        continue
+                    if (token_day, None) not in seen_pairs:
+                        seen_pairs.add((token_day, None))
+                        results.append({"day": token_day, "time": None})
+                # done with known_player fallback
+            elif date_obj:
+                day = date_obj.strftime('%A')
+                results.append({"day": day, "time": None})
+            else:
+                results.append({"day": None, "time": None})
+        elif date_obj:
+            # No known player record, but we have an email date to fall back on
+            day = date_obj.strftime('%A')
+            results.append({"day": day, "time": None})
+        else:
+            results.append({"day": None, "time": None})
 
     return results
+
 
 def format_time_for_output(t):
     if isinstance(t, time):
@@ -355,12 +396,14 @@ def load_known_players(filepath):
     with open(filepath, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Ensure 'Date' is a proper datetime object or string you can use later
-            known_players.append({
-                "Player Name": row["name"].strip(),
-                "Email": row["email"].strip(),
-                "Date": row["usual_date"].strip()  # or parse to datetime if needed
-            })
+            kp = {
+                "Player Name": row.get("name", "").strip(),
+                "Email": row.get("email", "").strip().lower(),
+                # tolerant mapping: prefer explicit 'usual_slots' but accept other column names
+                "usual_slots": (row.get("usual_slots") or row.get("usual_date") or
+                                row.get("usual_time") or row.get("Date") or "").strip()
+            }
+            known_players.append(kp)
     return known_players
 
 def load_regular_players(filepath):
@@ -377,6 +420,16 @@ def load_regular_players(filepath):
                 "usual_slots": row["usual_date"].strip()
             })
     return regular_players
+
+def find_known_player(known_players, sender_email=None, player_name=None):
+    if sender_email:
+        kp = next((kp for kp in known_players if kp.get("Email","").lower() == sender_email.lower()), None)
+        if kp:
+            return kp
+    if player_name:
+        kp = next((kp for kp in known_players if kp.get("Player Name","").lower() == player_name.lower()), None)
+        return kp
+    return None
 
 def expand_regular_players(regular_players, processed_schedule):
     """
@@ -436,7 +489,14 @@ def main():
         if contains_lesson_keywords(subject) or contains_lesson_keywords(body):
             display_name, _ = parseaddr(sender)
             player_name = display_name.strip() if display_name else 'Unknown'
-            parsed_requests = parse_lesson_requests(subject_clean, body_clean, player_name, known_players, date_obj)
+            parsed_requests = parse_lesson_requests(
+                subject_clean,
+                body_clean,
+                player_name,
+                known_players,
+                date_obj=date_obj,
+                sender_email=sender_email
+            )
             for req in parsed_requests:
                 lesson_requests.append({
                     'Date': req['day'],
@@ -454,10 +514,9 @@ def main():
     processed_schedule = preprocess_club_schedule(CLUB_SCHEDULE)
     lesson_requests = expand_lesson_requests(lesson_requests, processed_schedule)
 
-# Starting next week, I'll include this logic 
-    # regular_players = load_regular_players(REGULAR_PLAYERS_PATH)
-    # regular_entries = expand_regular_players(regular_players, processed_schedule)
-    # lesson_requests.extend(regular_entries)
+    regular_players = load_regular_players(REGULAR_PLAYERS_PATH)
+    regular_entries = expand_regular_players(regular_players, processed_schedule)
+    lesson_requests.extend(regular_entries)
 
 
     df = pd.DataFrame(lesson_requests)
