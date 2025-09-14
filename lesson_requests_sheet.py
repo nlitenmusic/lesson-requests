@@ -32,8 +32,24 @@ CLUB_SCHEDULE = {
     "Sunday": ["2:30pm", "3:30pm", "4:30pm", "5:30pm"]
 }
 LESSON_KEYWORDS = [
-    'lesson', 'hi jordan', 'book', 'kg', 'tennis', 'schedule', 'wednesday'
+    'lesson', 'hi jordan', 'book', 'kg' , 'schedule'
 ]
+# ===== CONFIG =====
+DAY_MAP = {
+    "mon": "Monday", "monday": "Monday",
+    "tue": "Tuesday", "tues": "Tuesday", "tuesday": "Tuesday",
+    "wed": "Wednesday", "weds": "Wednesday", "wednesday": "Wednesday",
+    "thu": "Thursday", "thurs": "Thursday", "thursday": "Thursday",
+    "fri": "Friday", "friday": "Friday",
+    "sat": "Saturday", "saturday": "Saturday",
+    "sun": "Sunday", "sunday": "Sunday"
+}
+
+DAY_REGEX = r'\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Weds|Wednesday|' \
+            r'Thu|Thurs|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b'
+
+TIME_REGEX = r'(?:1[0-2]|0?\d)(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)?'
+
 
 def authenticate_gmail():
     creds = None
@@ -141,6 +157,85 @@ def normalize_text(s: str) -> str:
         s = s.replace(ch, ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s    
+
+def replace_written_times(text: str) -> str:
+    """
+    Replace written-out times like 'one', 'two thirty', 'noon', 'midnight'
+    with numeric clock times (e.g., '1:00', '2:30', '12:00pm').
+    Ignores cases like 'one of', 'two of'.
+    """
+    # Basic map of numbers to digits
+    num_map = {
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10",
+        "eleven": "11",
+        "twelve": "12",
+        "noon": "12:00pm",
+        "midnight": "12:00am"
+    }
+
+    # Handle special tokens first
+    text = re.sub(r"\bnoon\b", "12:00pm", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bmidnight\b", "12:00am", text, flags=re.IGNORECASE)
+
+    # Match patterns like "two thirty", "seven fifteen", "nine o'clock"
+    # Normalize to digit + :minutes
+    def replace_match(m):
+        hour_word = m.group(1).lower()
+        minute_word = m.group(2)
+        hour_num = num_map.get(hour_word, hour_word)
+
+        if minute_word:
+            minute_word = minute_word.lower()
+            if minute_word in ["thirty"]:  # extendable
+                minute_num = "30"
+            elif minute_word in ["fifteen", "quarter"]:
+                minute_num = "15"
+            elif minute_word in ["fortyfive", "forty-five", "three-quarters"]:
+                minute_num = "45"
+            elif minute_word in ["o'clock"]:
+                minute_num = "00"
+            else:
+                return m.group(0)  # leave unchanged if unknown
+            return f"{hour_num}:{minute_num}"
+        else:
+            return f"{hour_num}:00"
+
+    # Add negative lookahead (?!\s+of) so "one of" / "two of" are ignored
+    time_pattern = re.compile(
+        r"\b(" + "|".join(num_map.keys()) + r")\b(?!\s+of)"
+        r"\s*(thirty|fifteen|quarter|fortyfive|forty-five|three-quarters|o'clock)?\b",
+        flags=re.IGNORECASE,
+    )
+    text = time_pattern.sub(replace_match, text)
+
+    return text
+
+
+def remove_excluded_times(text: str) -> str:
+    """
+    Remove time mentions that follow exclusion phrases such as:
+    'except', 'but not', 'other than', 'not'.
+    Example: 'except 7 am', 'but not 12', 'other than 2:30'.
+    """
+    exclusion_patterns = [
+        r"(?:except|but not|other than|not)\s+((?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?)|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|noon|midnight)\b)",
+    ]
+
+    cleaned_text = text
+    for pat in exclusion_patterns:
+        cleaned_text = re.sub(pat, "", cleaned_text, flags=re.IGNORECASE)
+
+    return cleaned_text
+
 
 def preprocess_time_edgecases(t):
     if not t:
@@ -267,37 +362,27 @@ def expand_lesson_requests(requests, club_schedule):
     return expanded_requests
 
 def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None, sender_email=None):
-    day_map = {
-        "mon": "Monday", "monday": "Monday",
-        "tue": "Tuesday", "tues": "Tuesday", "tuesday": "Tuesday",
-        "wed": "Wednesday", "weds": "Wednesday", "wednesday": "Wednesday",
-        "thu": "Thursday", "thurs": "Thursday", "thursday": "Thursday",
-        "fri": "Friday", "friday": "Friday",
-        "sat": "Saturday", "saturday": "Saturday",
-        "sun": "Sunday", "sunday": "Sunday"
-    }
-    day_regex = r'\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Weds|Wednesday|Thu|Thurs|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b'
-    time_regex = r'(?:1[0-2]|0?\d)(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)?'
-
     text = f"{subject} {body}"
+    text = remove_excluded_times(text)
+    text = replace_written_times(text)
     results = []
-    stop_tokens = r"(?=\b" + day_regex + r"\b|Sent|Thanks|Racquets|$)"
-    pattern = re.compile(day_regex + r"\b(.*?)" + stop_tokens, re.IGNORECASE | re.DOTALL)
+    stop_tokens = r"(?=" + DAY_REGEX + r"|Sent|Thanks|Racquets|$)"
+    pattern = re.compile(DAY_REGEX + r"\b(.*?)" + stop_tokens, re.IGNORECASE | re.DOTALL)
     seen_pairs = set()
 
     # Primary pass: find explicit day mentions and associated times (prefer times after the day)
     for match in pattern.finditer(text):
         raw_day = match.group(1)
-        day = day_map[raw_day.lower()]
+        day = DAY_MAP[raw_day.lower()]
         following_text = match.group(2)
         start_idx = match.start()
 
-        times_after = re.findall(time_regex, following_text, re.IGNORECASE)
+        times_after = re.findall(TIME_REGEX, following_text, re.IGNORECASE)
         if times_after:
             unique_times = set(times_after)
         else:
             preceding_text = text[max(0, start_idx - 30):start_idx]  # tighter window
-            times_before = re.findall(time_regex, preceding_text, re.IGNORECASE)
+            times_before = re.findall(TIME_REGEX, preceding_text, re.IGNORECASE)
             unique_times = set(times_before)
 
         for t in unique_times:
@@ -308,12 +393,12 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
                 results.append({"day": day, "time": time_obj})
 
     # Post-pass: collect all found day/time tokens for other heuristics
-    days_found = re.findall(day_regex, text, re.IGNORECASE)
-    times_found = re.findall(time_regex, text, re.IGNORECASE)
+    days_found = re.findall(DAY_REGEX, text, re.IGNORECASE)
+    times_found = re.findall(TIME_REGEX, text, re.IGNORECASE)
 
     # Case: multiple days listed and a single time -> map that time to all days
     if len(days_found) > 1 and len(times_found) == 1:
-        normalized_days = [day_map[d.lower()] for d in days_found]
+        normalized_days = [DAY_MAP[d.lower()] for d in days_found]
         norm_time = normalize_ampm(times_found[0])
         time_obj = parse_normalized_time(norm_time)
         for d in normalized_days:
@@ -323,7 +408,7 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
 
     # Case: days found but no times -> create day entries with time=None
     if not results and days_found and not times_found:
-        normalized_days = [day_map[d.lower()] for d in days_found]
+        normalized_days = [DAY_MAP[d.lower()] for d in days_found]
         for d in normalized_days:
             if (d, None) not in seen_pairs:
                 seen_pairs.add((d, None))
@@ -342,7 +427,7 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
                     for token in tokens:
                         if not token:
                             continue
-                        token_day = day_map.get(token.lower())
+                        token_day = DAY_MAP.get(token.lower())
                         if not token_day:
                             continue
                         for time_obj in time_objs:
@@ -360,7 +445,7 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
                 for token in tokens:
                     if not token:
                         continue
-                    token_day = day_map.get(token.lower())
+                    token_day = DAY_MAP.get(token.lower())
                     if not token_day:
                         continue
                     if (token_day, None) not in seen_pairs:
