@@ -34,7 +34,7 @@ CLUB_SCHEDULE = {
 LESSON_KEYWORDS = [
     'lesson', 'hi jordan', 'book', 'kg' , 'schedule'
 ]
-# ===== CONFIG =====
+
 DAY_MAP = {
     "mon": "Monday", "monday": "Monday",
     "tue": "Tuesday", "tues": "Tuesday", "tuesday": "Tuesday",
@@ -44,6 +44,23 @@ DAY_MAP = {
     "sat": "Saturday", "saturday": "Saturday",
     "sun": "Sunday", "sunday": "Sunday"
 }
+
+NUM_MAP = {
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10",
+        "eleven": "11",
+        "twelve": "12",
+        "noon": "12:00pm",
+        "midnight": "12:00am"
+    }
 
 DAY_REGEX = r'\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Weds|Wednesday|' \
             r'Thu|Thurs|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b'
@@ -165,22 +182,6 @@ def replace_written_times(text: str) -> str:
     Ignores cases like 'one of', 'two of'.
     """
     # Basic map of numbers to digits
-    num_map = {
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-        "ten": "10",
-        "eleven": "11",
-        "twelve": "12",
-        "noon": "12:00pm",
-        "midnight": "12:00am"
-    }
 
     # Handle special tokens first
     text = re.sub(r"\bnoon\b", "12:00pm", text, flags=re.IGNORECASE)
@@ -191,7 +192,7 @@ def replace_written_times(text: str) -> str:
     def replace_match(m):
         hour_word = m.group(1).lower()
         minute_word = m.group(2)
-        hour_num = num_map.get(hour_word, hour_word)
+        hour_num = NUM_MAP.get(hour_word, hour_word)
 
         if minute_word:
             minute_word = minute_word.lower()
@@ -211,13 +212,42 @@ def replace_written_times(text: str) -> str:
 
     # Add negative lookahead (?!\s+of) so "one of" / "two of" are ignored
     time_pattern = re.compile(
-        r"\b(" + "|".join(num_map.keys()) + r")\b(?!\s+of)"
+        r"\b(" + "|".join(NUM_MAP.keys()) + r")\b(?!\s+of)"
         r"\s*(thirty|fifteen|quarter|fortyfive|forty-five|three-quarters|o'clock)?\b",
         flags=re.IGNORECASE,
     )
     text = time_pattern.sub(replace_match, text)
 
     return text
+
+def expand_afternoon_text(text, club_schedule):
+    """
+    Replace occurrences like 'Sunday afternoon' with explicit '<Day> <Time>' strings
+    for each club slot after 12pm.
+    """
+    import re
+    import datetime
+
+    day_regex = r"\b(Mon|Monday|Tue|Tues|Tuesday|Wed|Weds|Wednesday|Thu|Thurs|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b"
+
+    def replace_afternoon(match):
+        day_word = match.group(1)
+        day = DAY_MAP[day_word.lower()]
+        times = club_schedule.get(day, [])
+
+        afternoon_times = []
+        for t in times:
+            try:
+                dt_obj = parse_normalized_time(normalize_ampm(t))
+                if dt_obj and dt_obj >= datetime.time(12, 0):
+                    # Prepend day to ensure correct pairing in parser
+                    afternoon_times.append(f"{day} {t}")
+            except Exception:
+                continue  # skip any times that fail parsing
+
+        return " ".join(afternoon_times)
+
+    return re.sub(day_regex + r"\s+afternoon", replace_afternoon, text, flags=re.IGNORECASE)
 
 
 def remove_excluded_times(text: str) -> str:
@@ -361,9 +391,43 @@ def expand_lesson_requests(requests, club_schedule):
 
     return expanded_requests
 
+def parse_subject_only(subject: str):
+    """
+    Parse lesson requests from the email subject only. 
+    Handles multiple days and multiple times, normalized to datetime.time objects.
+    """
+    results = []
+    seen_pairs = set()
+
+    # Find all day references in the subject
+    days_found = re.findall(DAY_REGEX, subject, re.IGNORECASE)
+
+    # Find all times in the subject
+    times_found = re.findall(TIME_REGEX, subject, re.IGNORECASE)
+
+    # Normalize times
+    time_objs = [parse_normalized_time(normalize_ampm(t)) for t in times_found]
+
+    # Map each day to all requested times
+    for d in days_found:
+        day = DAY_MAP[d.lower()]
+        if time_objs:
+            for time_obj in time_objs:
+                if (day, time_obj) not in seen_pairs:
+                    seen_pairs.add((day, time_obj))
+                    results.append({"day": day, "time": time_obj})
+        else:
+            # If no times found, still create entry with None
+            if (day, None) not in seen_pairs:
+                seen_pairs.add((day, None))
+                results.append({"day": day, "time": None})
+
+    return results    
+
 def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None, sender_email=None):
     text = f"{subject} {body}"
     text = remove_excluded_times(text)
+    text = expand_afternoon_text(text, CLUB_SCHEDULE)
     text = replace_written_times(text)
     results = []
     stop_tokens = r"(?=" + DAY_REGEX + r"|Sent|Thanks|Racquets|$)"
@@ -466,7 +530,6 @@ def parse_lesson_requests(subject: str, body: str, player_name, known_players, d
 
     return results
 
-
 def format_time_for_output(t):
     if isinstance(t, time):
         return t.strftime("%I:%M %p").lstrip("0")
@@ -545,15 +608,20 @@ def main():
 
     lesson_requests = [] 
     processed_threads = set()
+    keyword_threads = set()           # threads matched by keyword parser
+    subject_only_candidates = []
     
+    # --- first pass: keyword parsing (populate lesson_requests) and collect candidates ---
     for msg_detail in filtered_messages:
         thread_id = msg_detail['threadId']
         if thread_id in processed_threads:
             continue
         processed_threads.add(thread_id)
+
+        # fetch the full thread
         thread = service.users().threads().get(userId='me', id=thread_id, format='full').execute()
         first_msg = thread['messages'][0]
-        headers = first_msg['payload']['headers']
+        headers = first_msg['payload'].get('headers', [])
         subject = next((h['value'] for h in headers if h['name'] == 'Subject'), '')
         sender = next((h['value'] for h in headers if h['name'] == 'From'), '')
         date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
@@ -561,19 +629,24 @@ def main():
         body = extract_email_body(first_msg['payload'])
         sender_email = sender.split('<')[-1].replace('>', '').strip().lower()
 
+        # ignore self or blocked senders
         if sender_email == MY_EMAIL.lower() or sender_email in BLOCKED_SENDERS:
             continue
 
+        # clean text
         subject_clean = normalize_text(subject)
         body_clean = normalize_text(body)
         body_clean = strip_end_content(body_clean)
         body_clean = remove_month_dates(body_clean)
         body_clean = strip_signature_numbers(body_clean)
         subject_clean = remove_month_dates(subject_clean)
-        
+
+        # who sent it (for naming)
+        display_name, _ = parseaddr(sender)
+        player_name = display_name.strip() if display_name else 'Unknown'
+
+        # If email contains lesson keywords -> use main parser and append results
         if contains_lesson_keywords(subject) or contains_lesson_keywords(body):
-            display_name, _ = parseaddr(sender)
-            player_name = display_name.strip() if display_name else 'Unknown'
             parsed_requests = parse_lesson_requests(
                 subject_clean,
                 body_clean,
@@ -582,15 +655,51 @@ def main():
                 date_obj=date_obj,
                 sender_email=sender_email
             )
-            for req in parsed_requests:
-                lesson_requests.append({
-                    'Date': req['day'],
-                    'Player Name': player_name,
-                    'Requested Time': req['time'],
-                    'Subject': subject,
-                    'Body Snippet': body_clean,
-                    'Email': sender_email
-                })
+            if parsed_requests:
+                for req in parsed_requests:
+                    lesson_requests.append({
+                        'Date': req['day'],
+                        'Player Name': player_name,
+                        'Requested Time': req['time'],
+                        'Subject': subject,
+                        'Body Snippet': body_clean,
+                        'Email': sender_email
+                    })
+                keyword_threads.add(thread_id)   # mark this thread as handled by keywords
+            # if parsed_requests empty, we still don't put this thread through subject-only
+            # because it had lesson keywords (explicit request) and you said first-pass should own that.
+        else:
+            # Candidate for subject-only fallback: store minimal handy pieces for second pass
+            subject_only_candidates.append({
+                'thread_id': thread_id,
+                'subject_clean': subject_clean,
+                'subject_raw': subject,
+                'body_snippet': body_clean,
+                'sender_email': sender_email,
+                'player_name': player_name,
+                'date_obj': date_obj
+            })
+
+    # --- second pass: subject-only parsing for threads not matched by keywords ---
+    for c in subject_only_candidates:
+        # skip if the same thread somehow got handled by the keyword pass
+        if c['thread_id'] in keyword_threads:
+            continue
+
+        parsed = parse_subject_only(c['subject_clean'])
+        if not parsed:
+            continue
+
+        # attach player info and append to the same lesson_requests list
+        for req in parsed:
+            lesson_requests.append({
+                'Date': req['day'],
+                'Player Name': c['player_name'],
+                'Requested Time': req['time'],
+                'Subject': c['subject_raw'],
+                'Body Snippet': c['body_snippet'],
+                'Email': c['sender_email']
+            })
 
     if not lesson_requests:
         print("The lesson availability email hasn't been sent or no lessons requested yet")
@@ -603,8 +712,8 @@ def main():
     regular_entries = expand_regular_players(regular_players, processed_schedule)
     lesson_requests.extend(regular_entries)
 
-
     df = pd.DataFrame(lesson_requests)
+
     weekday_order = {
         'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
         'Friday': 4, 'Saturday': 5, 'Sunday': 6
