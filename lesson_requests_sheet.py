@@ -26,13 +26,14 @@ BLOCKED_SENDERS = os.getenv("BLOCKED_SENDERS").split(",")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE")
 TOKEN_FILE = os.getenv("TOKEN_FILE")
 CLUB_SCHEDULE = {
-    "Monday": ["12:00pm", "1:30pm", "2:30pm"],
-    "Wednesday": ["7:00am", "2:30pm"],
-    "Thursday": ["1:30pm", "2:30pm"],
-    "Sunday": ["2:30pm", "3:30pm", "4:30pm", "5:30pm"]
+    "Monday": ["1:30pm", "2:30pm"],
+    "Tuesday": ["2:30pm"],
+    "Wednesday": ["7:00am", "9:00am", "10:00am", "2:30pm"],
+    "Thursday": ["2:30pm"],
+    "Sunday": ["12:00pm", "1:30pm", "2:30pm", "3:30pm"]
 }
 LESSON_KEYWORDS = [
-    'lesson', 'hi jordan', 'book', 'kg' , 'schedule'
+    'lesson', 'hi jordan', 'book', 'kg' , 'schedule', 'private'
 ]
 
 DAY_MAP = {
@@ -165,6 +166,20 @@ def extract_email_body(payload):
                 return soup.get_text(separator='\n').strip()
     return ""
 
+def normalize_dotted_times(text: str) -> str:
+    """
+    Convert dotted times like '2.30' or '10.45am' into '2:30' / '10:45am'
+    so they can be parsed by the normal pipeline.
+    """
+    import re
+    # Match 1–2 digit hour, dot, 2 digit minutes, optional am/pm
+    return re.sub(
+        r"\b(\d{1,2})\.(\d{2})(\s*[ap]\.?m\.?)?\b",
+        lambda m: f"{m.group(1)}:{m.group(2)}{m.group(3) or ''}",
+        text,
+        flags=re.IGNORECASE,
+    )
+
 def normalize_text(s: str) -> str:
     if not s:
         return ''
@@ -174,6 +189,29 @@ def normalize_text(s: str) -> str:
         s = s.replace(ch, ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s    
+
+def skip_one_hour_phrases(text: str) -> str:
+    """
+    Removes 'one hour' / 'one-hour' / 'one–hour' / 'one—hour' and
+    other dash variants so they don't parse as 1pm.
+    """
+    import re
+    # \u2010 to \u2015 = common Unicode dash characters
+    # \u2212 = minus sign (sometimes shows up)
+    dash_chars = r"\-\u2010-\u2015\u2212"
+    pattern = rf"\bone[\s{dash_chars}]?hour\b"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+import re
+
+def remove_ordinals(text: str) -> str:
+    """
+    Removes numbers that have ordinal suffixes (1st, 2nd, 3rd, 24th, etc.)
+    so they aren’t misinterpreted as lesson times.
+    """
+    # Match digits followed by st, nd, rd, th (case-insensitive)
+    return re.sub(r'\b\d+(?:st|nd|rd|th)\b', '', text, flags=re.IGNORECASE)
+
 
 def replace_written_times(text: str) -> str:
     """
@@ -303,7 +341,7 @@ def strip_end_content(text: str) -> str:
     forwarded_markers = [
         "Forwarded message", "---------- Forwarded message ---------",
         "---------- Original Message ----------", "-------- Original message --------",
-        "On Wed, ", "Begin forwarded message:", "Thanks", "Best"
+        "On Wed, ", "Begin forwarded message:", "Thanks", "Best", "---------------------"
     ]
     for marker in forwarded_markers:
         idx = text.lower().find(marker.lower()) 
@@ -426,7 +464,10 @@ def parse_subject_only(subject: str):
 
 def parse_lesson_requests(subject: str, body: str, player_name, known_players, date_obj=None, sender_email=None):
     text = f"{subject} {body}"
+    text = skip_one_hour_phrases(text)
+    text = remove_ordinals(text)
     text = remove_excluded_times(text)
+    text = normalize_dotted_times(text) 
     text = expand_afternoon_text(text, CLUB_SCHEDULE)
     text = replace_written_times(text)
     results = []
